@@ -10,8 +10,8 @@ Melodee's source tree. A module built once keeps working across firmware updates
     get_toolchain.sh  the JieLi toolchain the builder compiles with
     example/drone.c   a complete module
 
-The SDK lives in Melodee's source tree (`firmware/modules/sdk`), beside the firmware that keeps its contract, and is
-published from there on its own.
+This repository is the SDK's home. Melodee's firmware takes it as a git submodule at `firmware/modules/sdk`, pinned to
+a commit of this one: a change to the contract or the builder lands here first, then the firmware moves its pin.
 
 ## Build
 
