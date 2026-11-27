@@ -43,7 +43,8 @@ IDNT (who it is), SIGN (the signature, last).
 table and installs the file without the chunk: the device's file, byte for byte. emcc: a local one, else the emsdk
 Docker image web/core/build.sh uses (EMSDK_IMAGE). Written to build/modules/wasm/<name>.mmod.
 
---native: the same file with an AA64 chunk last, an SDK module's source built for AArch64 (Linux on the MPC Sample's A55,
+--native: the same file with an AA64 chunk last, its source built for AArch64 (an SDK module's anywhere; an engine-source
+module's in Melodee's tree, with the firmware's headers and -DMOD_NATIVE: mod_engine.h; Linux on the MPC Sample's A55,
 macOS on Apple silicon: x18 left alone, the platform register there) with clang and ld.lld (NATIVE_CC, NATIVE_LD),
 freestanding as on the device (mod_rt.c, no library). It links twice as the device's image does (module_a64.ld: the
 descriptor first, the data on 16 KB pages of its own) and keeps the 64-bit absolute words (R_AARCH64_ABS64) as its
@@ -83,11 +84,6 @@ DOCKER_IMAGE = os.environ.get("JIELI_DOCKER_IMAGE", "debian:bookworm-slim")
 R_ABS32, R_MOV_ABS32 = 8, 5
 BASE2 = 0x00100000                                    # the second link's base
 HOST_CALL = 160                                       # a call through the host table (its deepest callee and below)
-NENGINES, ENGI_MOD0 = 48, 22
-# the synths Melodee makes (firmware/modules/shipped.h): their numbers and IDs, the device's default engine map
-SHIPPED = {int(m[1]): int(m[2], 16) for m in re.finditer(r"X\((\d+)u, 0x([0-9A-Fa-f]+)(?:ULL|u),",
-                                                          (SDK.parent / "shipped.h").read_text())} \
-    if (SDK.parent / "shipped.h").is_file() else {}
 IDNT_TAG = 0x544E4449                                # "IDNT": who the module is (mod_abi3.h mod_ident_v3)
 SIGN_TAG = 0x4E474953                                # "SIGN": Ed25519 of the bytes from the head's end to it, the last
 
@@ -377,9 +373,6 @@ def describe(img, words, bss=0):
     for at in (ENG_NOTE_ON, ENG_RENDER):
         if eng + at not in ws or u32(img, eng + at) >= len(img):
             raise SystemExit("mod_build: the engine's note_on and render must be the module's own")
-    if not (engine in SHIPPED or (not SHIPPED and engine < ENGI_MOD0)) and not ENGI_MOD0 <= engine < NENGINES:
-        raise SystemExit(f"mod_build: engine {engine}: a module asks for {ENGI_MOD0}..{NENGINES - 1} (below: Melodee's "
-                         f"own synths, firmware/modules/shipped.h {sorted(SHIPPED)})")
     if key:
         raise SystemExit("mod_build: a module names no firmware data key (host 4: its pads and records are the host "
                          "table's)")
@@ -438,13 +431,6 @@ def build(src, out, version, defs):
     uid = struct.unpack_from("<I", mid)[0]
     if not uid:
         raise SystemExit(f"mod_build: {vendor}/{slug}'s ID begins with 4 zero bytes: pick another slug")
-    if engine < ENGI_MOD0 and not SHIPPED and not melodee:
-        raise SystemExit(f"mod_build: engine {engine} is one of Melodee's own synths' numbers: ask for "
-                         f"{ENGI_MOD0}..{NENGINES - 1} (a device gives a module the number it asks for when it is free)")
-    if engine in SHIPPED and SHIPPED[engine] != struct.unpack("<Q", mid)[0]:
-        raise SystemExit(f"mod_build: engine {engine} is {SHIPPED[engine]:016x}'s (firmware/modules/shipped.h), this "
-                         f"module is {vendor}/{slug} {mid.hex()}" + ("" if ikey else " (unsigned)") +
-                         f": ask for {ENGI_MOD0}..{NENGINES - 1}")
     packed = pack_image(img)                         # (the file holds it packed when that is smaller)
     body = (packed or img) + b"".join(struct.pack("<I", w) for w in words)
     if engine_src:                                   # (the host firmware's makers and descriptions)
@@ -483,7 +469,8 @@ def host_tool(out):
     built in)"""
     cc = os.environ.get("HOST_CC", os.environ.get("CC", "cc")).split()
     out.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run([*cc, "-O0", "-w", "-ffp-contract=off", "-Ibuild/gen", "-Ifirmware/src", "-Itests",
+    # (-O1, as the host tests build: gcc at -O0 emits the hal's always-inline functions, the FM-1's csync with them)
+    r = subprocess.run([*cc, "-O1", "-w", "-ffp-contract=off", "-Ibuild/gen", "-Ifirmware/src", "-Itests",
                         str(SRC / "tools" / "mod_presets.c"), "-o", str(out), "-lm"], cwd=SRC, capture_output=True,
                        text=True)
     if r.returncode:
@@ -828,9 +815,10 @@ def native_seed(path, b, end):
     return seed
 
 
-def native(path, out, src=None):
+def native(path, out, src=None, defs=()):
     """path (a built .mmod) again with its source (src; Melodee's tree: firmware/modules/<name>/<name>.c) built for
-    AArch64 in an AA64 chunk, last"""
+    AArch64 in an AA64 chunk, last; an engine-source module (Melodee's tree only) with the firmware's headers and the
+    image's options (defs: -D flags, as tools/build.py gives the device's build)"""
     b = bytearray(path.read_bytes())
     magic, abi, engine, flags, total, image, bss, nrel, desc, crc, name, version, npre, r0, key, host, r1 = HEAD.unpack_from(b)
     if magic != FILE_MAGIC or abi != ABI or total != len(b) or zlib.crc32(b[HEAD.size:]) != crc:
@@ -843,9 +831,9 @@ def native(path, out, src=None):
     src = src or (SRC / "firmware" / "modules" / stem / (stem + ".c") if SRC else None)
     if not src or not src.exists():
         raise SystemExit(f"mod_build: no source for {path.name} (--src)")
-    if is_engine(src):
-        raise SystemExit("mod_build: --native builds SDK modules (mod_sdk.h); an engine-source module needs the "
-                         "firmware's headers and tables")
+    engine_src = is_engine(src)
+    if engine_src and not SRC:
+        raise SystemExit("mod_build: an engine-source module (mod_engine.h) builds in Melodee's tree only")
     cc, ld = os.environ.get("NATIVE_CC", "clang"), os.environ.get("NATIVE_LD", "ld.lld")
     for tool in (cc, ld):
         if not shutil.which(tool):
@@ -855,6 +843,11 @@ def native(path, out, src=None):
     obj, rt = work / (stem + ".o"), work / "mod_rt.o"
     e0, e1 = work / (stem + ".elf"), work / (stem + ".b2.elf")
     inc = ["-I" + str(SDK)]
+    if engine_src:                                   # (freestanding as on the device: mod_engine.h MOD_NATIVE; the
+        # firmware's tables come through the host table, its math is inline: nothing of the firmware's links)
+        inc = ["-DMOD_NATIVE=1", *defs, "-Wno-unused-variable", "-Wno-unused-const-variable",
+               "-Wno-unused-but-set-variable", *("-I" + str(SRC / d) for d in
+                                                 ("firmware/src", "firmware/hal", "build/gen", "firmware/modules/sdk"))]
 
     def run(cmd):
         r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
@@ -925,7 +918,9 @@ def main():
         if not SRC and not a.src_c:
             raise SystemExit("mod_build: --native outside Melodee's tree needs the module's source (--src SRC.c)")
         out = a.out or (SRC / "build" / "modules" / "native" if SRC else a.src.parent / "native") / a.src.name
-        return native(a.src.resolve(), out.resolve(), a.src_c.resolve() if a.src_c else None)
+        if any(not d.startswith("-D") for d in rest):
+            raise SystemExit(f"mod_build: unknown arguments {rest}")
+        return native(a.src.resolve(), out.resolve(), a.src_c.resolve() if a.src_c else None, rest)
     src = a.src.resolve()
     out = (a.out or (SRC / "build" / "modules" if SRC else src.parent) / (src.stem + ".mmod")).resolve()
     if any(not d.startswith("-D") for d in rest):
